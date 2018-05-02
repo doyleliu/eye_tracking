@@ -26,6 +26,9 @@ import math
 
 from queue import Queue
 
+import unittest
+import threedface.api as api
+
 
 def parse_args():
     """input arguments"""
@@ -69,7 +72,7 @@ def RaySphereIntersect(rayOrigin, rayDir, sphereOrigin, sphereRadius):
     b = 2*dx*(x0-cx) + 2*dy*(y0-cy) + 2*dz*(z0-cz)
     c = cx*cx + cy*cy + cz*cz + x0*x0 + y0*y0 + z0*z0 + -2*(cx*x0 + cy*y0 + cz*z0) - r*r
 
-    # disc = b*b - 4*a*c
+    disc = b*b - 4*a*c
 
     t = (-b - math.sqrt(b*b - 4*a*c))/2*a
 
@@ -85,6 +88,13 @@ def get_pupil_location(eye):
     B = A / 4
 
     return B
+
+def GetPupilPosition(eye):
+    eye_transpose = np.transpose(eye)
+    print(eye_transpose.shape)
+    irisLdmks3d = np.array([np.mean(eye_transpose[0]), np.mean(eye_transpose[1]), np.mean(eye_transpose[2])])
+    
+    return irisLdmks3d
 
 
 def eulerAnglesToRotationMatrix(theta):
@@ -110,33 +120,88 @@ def eulerAnglesToRotationMatrix(theta):
 
     return R
 
+def rotationMatrixToEulerAngles(R) :
 
-def estimate_gaze(headpos, eye, isleft_eye):
+    # assert(isRotationMatrix(R))
+    
+    sy = math.sqrt(R[0,0] * R[0,0] +  R[1,0] * R[1,0])
+    
+    singular = sy < 1e-6
+
+    if  not singular :
+        x = math.atan2(R[2,1] , R[2,2])
+        y = math.atan2(-R[2,0], sy)
+        z = math.atan2(R[1,0], R[0,0])
+    else :
+        x = math.atan2(-R[1,2], R[1,1])
+        y = math.atan2(-R[2,0], sy)
+        z = 0
+
+    return np.array([x, y, z])
+
+
+def estimate_gaze(headpos, eye, threedfaciallandmark, isleft_eye):
     eulerAngles = headpos
     rotMat = eulerAnglesToRotationMatrix(eulerAngles)
-    eyeLdmks3d = eye
+    # eyeLdmks3d = eye
+    if(isleft_eye):
+        eyeLdmks3d = threedfaciallandmark[36:42]
+    else:
+        eyeLdmks3d = threedfaciallandmark[42:48]
 
-    pupil = get_pupil_location(eyeLdmks3d)
+    pupil = GetPupilPosition(eyeLdmks3d)
+    # pupil = get_pupil_location(eyeLdmks3d)
     rayDir = pupil / cv2.norm(pupil)
 
     # cv::Mat faceLdmks3d = clnf_model.GetShape(fx, fy, cx, cy);
     # faceLdmks3d = faceLdmks3d.t();
 
     offset = [0, -3.5, 7.0]
-
-    eyeballCentre = (eye[0] + eye[3]) / 2.0 + rotMat * offset
+    # offset = [7.0, -3.5, 0]
+    offset = np.transpose(offset)
+    # print(rotMat.shape)
+    # print(offset.shape)
+    # ceshi = np.dot(rotMat, offset)
+    # print(threedfaciallandmark[36].shape)
+    # print(ceshi.shape)
+    if(isleft_eye):
+        eyeballCentre = (threedfaciallandmark[36] + threedfaciallandmark[39]) / 2.0 + np.transpose(np.dot(rotMat, offset)) 
+    else:
+        eyeballCentre = (threedfaciallandmark[42] + threedfaciallandmark[45]) / 2.0 + np.transpose(np.dot(rotMat, offset)) 
 
     gazeVecAxis = RaySphereIntersect([0, 0, 0], rayDir, eyeballCentre, 12) - eyeballCentre
     gaze_absolute = gazeVecAxis / cv2.norm(gazeVecAxis)
 
+    # gaze_absolute = rotationMatrixToEulerAngles(gaze_absolute)
     return gaze_absolute
 
 
-def judge_fatigue(perclos, headpos):
-    # detect the driver fatigue using the input factors
+def judge_fatigue(perclos, dist):
+    # detect the driver fatigue using the input factors with perclos and eye gaze distraction
     if(perclos > 0.5):
         print("false")
+        return False
+    elif(perclos > 0.3 and dist == False):
+        print("false")
+        return False
+    else:
+        print("true")
+        return True
 
+
+def distract_detect(eyegazequeue):
+    cnt = 0
+    final_queue = Queue()
+    for i in range(0, eyegazequeue.qsize()):
+        tmp_queue = eyegazequeue.get()
+        final_queue.put(tmp_queue)
+        if(tmp_queue is False):
+            cnt = cnt + 1
+        
+    if(cnt > final_queue.qsize() / 3):
+        return final_queue, False
+    else:
+        return final_queue,True
 
 EYE_AR_THRESH = 0.25
 EYE_AR_CONSEC_FRAMES = 3
@@ -186,6 +251,7 @@ if __name__ == '__main__':
     predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 
     (lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+    # print(lStart, lEnd)
     (rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
 
     vs = FileVideoStream(video_path).start()
@@ -217,6 +283,11 @@ if __name__ == '__main__':
     frame_per_count = 0
     # frame queue
     frame_queue = Queue()
+    # eye gaze distraction
+    distract = Queue()
+    # 3d face alignment detection
+    fa = api.FaceAlignment(api.LandmarksType._3D, enable_cuda=False)
+    preds = []
 
     while True:
         # leftEyeHull = 0；
@@ -283,8 +354,8 @@ if __name__ == '__main__':
                     yaw_predicted = torch.sum(yaw_predicted.data[0] * idx_tensor) * 3 - 99
                     pitch_predicted = torch.sum(pitch_predicted.data[0] * idx_tensor) * 3 - 99
                     roll_predicted = torch.sum(roll_predicted.data[0] * idx_tensor) * 3 - 99
-                    print("first:")
-                    print([yaw_predicted, pitch_predicted, roll_predicted])
+                    # print("first:")
+                    # print([yaw_predicted, pitch_predicted, roll_predicted])
 
                     # Print new frame with cube and axis
                     # txt_out.write(str(frame_cnt) + ' %f %f %f\n' % (yaw_predicted, pitch_predicted, roll_predicted))
@@ -295,7 +366,19 @@ if __name__ == '__main__':
             utils.draw_axis(frame,  yaw_predicted, pitch_predicted, roll_predicted, tdx = (x_min + x_max) / 2, tdy= (y_min + y_max) / 2, size = bbox_height/2)
 
         headpos = [yaw_predicted, pitch_predicted, roll_predicted]
-        print("second")
+
+        tmpframe = cv2.imwrite("tmp.jpg",frame)
+        input = io.imread("tmp.jpg")
+        try:
+            preds = fa.get_landmarks(input)[-1]
+        except:
+            preds = preds
+        
+
+        # threedleft = preds[]
+        print(preds.shape)
+
+        print("Pose Estimation")
         print(headpos)
         for rect in rects:
             shape = predictor(gray, rect)
@@ -339,7 +422,7 @@ if __name__ == '__main__':
             cv2.circle(frame, tuple(left_Iris), 2, [0, 0, 255], -1) #left_iris
             cv2.circle(frame, tuple(right_Iris), 2, [0, 255, 0], -1) #right_iris
 
-            # estimate_gaze(headpos,  leftEye, True)
+            
 
             leftEyeHull = cv2.convexHull(leftEye)
             rightEyeHull = cv2.convexHull(rightEye)
@@ -357,6 +440,27 @@ if __name__ == '__main__':
             #     COUNTER = 0
             # cv2.putText(frame, "blinks: {}".format(TOTAL), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+        # print("Gaze estimation")
+        # predict_gaze = estimate_gaze(headpos, leftEye, preds, True)
+        # print(predict_gaze)
+
+        # gaze estimation over a period of time 
+        if(headpos[0] > 30 or headpos[1] > 30 or headpos[2]>30 ):
+                # frame_per_count = frame_per_count + 1
+            if(distract.qsize() < 30):
+                distract.put(False)
+            else:
+                distract.get()
+                distract.put(False)
+        else:
+            if(distract.qsize() < 30):
+                distract.put(True)
+            else:
+                distract.get()
+                distract.put(True)
+        distract, gazedist = distract_detect(distract)
+
+        
         
         cv2.imshow("Frame", frame)
         frame_queue_tmp = Queue()
@@ -371,6 +475,8 @@ if __name__ == '__main__':
         print("the eye closure over the time: ")
         if(frame_queue.qsize() > 0):
             print(frame_per_count / (1.0 * frame_queue.qsize()))
+
+        judge_fatigue(frame_per_count / (1.0 * frame_queue.qsize()), gazedist)
         # out.write(frame)
         # print(frame.shape)
         videoWriter.write(frame)
